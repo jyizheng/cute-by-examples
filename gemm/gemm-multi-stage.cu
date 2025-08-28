@@ -1,15 +1,17 @@
 #include <cublas_v2.h>
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include <stdarg.h>
 #include <stdio.h>
 
+#include <assert.h>
 #include <cute/tensor.hpp>
 
 #include "detail/cublaslt-gemm.h"
 #include "detail/data.h"
 
 template <typename Config>
-__global__ void /* __launch_bounds__(128, 1) */
+__global__ void __launch_bounds__(Config::kThreadNum, 1)
 gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
                  int k) {
   using namespace cute;
@@ -272,13 +274,9 @@ struct GemmConfig {
                                make_layout(make_shape(Int<1>{}, Int<8>{}))));
   using G2SCopyB = G2SCopyA;
 
-  // shared memory to register copy
-  using s2r_copy_op = SM75_U32x4_LDSM_N;
-  using s2r_copy_traits = Copy_Traits<s2r_copy_op>;
-  using s2r_copy_atom = Copy_Atom<s2r_copy_traits, T>;
-
-  using S2RCopyAtomA = s2r_copy_atom;
-  using S2RCopyAtomB = s2r_copy_atom;
+  // SM80: TN MMA 中 A 为 T，B 为 N
+  using S2RCopyAtomA = Copy_Atom<Copy_Traits<SM75_U32x4_LDSM_N>, T>;
+  using S2RCopyAtomB = Copy_Atom<Copy_Traits<SM75_U32x4_LDSM_N>, T>;
 
   // epilogue: register to global via shared memory
   using SmemLayoutAtomC = decltype(composition(
@@ -392,15 +390,23 @@ int main(int argc, char *argv[]) {
             (M + gemm_config.kTileM - 1) / gemm_config.kTileM);
   int shm_size = gemm_config.kShmSize;
 
-  half alpha = 1.f;
-  half beta = 0.f;
+  assert((M % config::GemmConfig<T,128,128,32,3>::kTileM) == 0 &&
+         (N % config::GemmConfig<T,128,128,32,3>::kTileN) == 0 &&
+         (K % config::GemmConfig<T,128,128,32,3>::kTileK) == 0);
+
+  __half alpha = __float2half(1.f);
+  __half beta  = __float2half(0.f);
 
   for (int it = 0; it < nt; ++it) {
     // blas
     cudaMemset(Dptr_cublas, 0, sizeof(T) * M * N);
     cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
-                                     &alpha, (half *)Bptr, K, (half *)Aptr, K,
-                                     &beta, (half *)Dptr_cublas, N);
+                          &alpha,
+                          reinterpret_cast<const __half*>(Bptr), K,
+                          reinterpret_cast<const __half*>(Aptr), K,
+                          &beta,
+                          reinterpret_cast<__half*>(Dptr_cublas), N);
+
     if (ret != CUBLAS_STATUS_SUCCESS) {
       printf("cublas err = %d, str = %s\n", ret, cublasGetStatusString(ret));
     }
@@ -411,9 +417,13 @@ int main(int argc, char *argv[]) {
     }
 
     // multi-stage
-    cudaMemset(Dptr, 0, sizeof(T) * M * N);
-    cudaFuncSetAttribute(gemm_multi_stage<decltype(gemm_config)>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    cudaError_t setAttr = cudaFuncSetAttribute(
+        gemm_multi_stage<decltype(gemm_config)>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    if (setAttr != cudaSuccess) {
+      printf("cudaFuncSetAttribute failed: %s\n", cudaGetErrorString(setAttr));
+    }
+
     gemm_multi_stage<decltype(gemm_config)>
         <<<grid, block, shm_size>>>(Dptr, Aptr, Bptr, M, N, K);
   }
