@@ -1,8 +1,10 @@
 #include <cublas_v2.h>
 #include <cuda.h>
+#include <cuda_fp16.h>
 #include <stdarg.h>
 #include <stdio.h>
 
+#include <assert.h>
 #include <cute/tensor.hpp>
 
 #include "detail/cublaslt-gemm.h"
@@ -180,6 +182,9 @@ gemm_multi_stage(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   auto s2g_thr_copy_c = s2g_tiled_copy_c.get_thread_slice(idx);
   auto tCsC_s2g = s2g_thr_copy_c.partition_S(sC);  // (CPY, _1, _1, pipe)
   auto tCgC_s2g = s2g_thr_copy_c.partition_D(gD);  // (CPY, CPY_M, CPY_N)
+
+  //auto tCgC_s2gx = group_modes<1, 2>(tCgC_s2g);  // (CPY_, CPY_MN)
+  //auto tCrC_r2sx = group_modes<1, 2>(tCrC_r2s);  // (CPY_, CPY_MN)
 
   auto tCgC_s2gx = group_modes<1, 3>(tCgC_s2g);  // (CPY_, CPY_MN)
   auto tCrC_r2sx = group_modes<1, 3>(tCrC_r2s);  // (CPY_, CPY_MN)
@@ -392,15 +397,24 @@ int main(int argc, char *argv[]) {
             (M + gemm_config.kTileM - 1) / gemm_config.kTileM);
   int shm_size = gemm_config.kShmSize;
 
-  half alpha = 1.f;
-  half beta = 0.f;
+  //half alpha = 1.f;
+  //half beta = 0.f;
+  __half alpha = __float2half(1.f);
+  __half beta  = __float2half(0.f);
 
   for (int it = 0; it < nt; ++it) {
     // blas
     cudaMemset(Dptr_cublas, 0, sizeof(T) * M * N);
+    //cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+    //                                 &alpha, (half *)Bptr, K, (half *)Aptr, K,
+    //                                 &beta, (half *)Dptr_cublas, N);
     cublasStatus_t ret = cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
-                                     &alpha, (half *)Bptr, K, (half *)Aptr, K,
-                                     &beta, (half *)Dptr_cublas, N);
+                          &alpha,
+                          reinterpret_cast<const __half*>(Bptr), K,
+                          reinterpret_cast<const __half*>(Aptr), K,
+                          &beta,
+                          reinterpret_cast<__half*>(Dptr_cublas), N);
+
     if (ret != CUBLAS_STATUS_SUCCESS) {
       printf("cublas err = %d, str = %s\n", ret, cublasGetStatusString(ret));
     }
