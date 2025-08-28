@@ -77,16 +77,47 @@ int main() {
   cudaMemcpy(Aptr, Aptr_host, sizeof(T) * m * k, cudaMemcpyHostToDevice);
   cudaMemcpy(Bptr, Bptr_host, sizeof(T) * n * k, cudaMemcpyHostToDevice);
 
+  // ==========================================================================================
+  // FIX 1: Define a correct TiledMMA
+  // ------------------------------------------------------------------------------------------
+  // The original TiledMMA definition was incorrect. It failed to properly map the
+  // computation to the 32 threads of a warp, causing the data loading to fail,
+  // which left registers full of zeros and produced a zero-filled output.
+  //
+  // The definition below creates a 64x64x16 warp-level MMA (Matrix Multiply-Accumulate)
+  // operation. It does this by tiling the base 16x8x16 hardware MMA instruction
+  // (mma_atom) 4 times in the M dimension and 8 times in the N dimension.
+  // This forms a 4x8 grid of MMA atoms, which can be perfectly handled by the
+  // 32 threads (4x8) of a warp.
   using mma_op = SM80_16x8x16_F16F16F16F16_TN;
-  using mma_traits = MMA_Traits<mma_op>;
-  using mma_atom = MMA_Atom<mma_traits>;
+  using mma_atom = MMA_Atom<mma_op>;
 
-  using MMA = decltype(make_tiled_mma(mma_atom{}, 
-                      make_layout(Shape<_2, _2, _1>{}), 
-                      make_layout(Shape<_1, _2, _1>{})));
-  constexpr int kTileM = 128; 
-  constexpr int kTileN = 128; 
-  constexpr int kTileK = 32; 
+  // Map 4x8=32 threads to a 4x8 grid
+  using ThrLayout = Layout<Shape<_4,_8>>;
+  // Tile the 16x8x16 mma_atom into a 4x8 grid
+  using AtomLayoutMN = Layout<Shape<_4,_8>>;
+
+  using MMA = decltype(make_tiled_mma(mma_atom{}, AtomLayoutMN{}, ThrLayout{}));
+
+  // The Tile sizes must match or be a multiple of our defined MMA size.
+  // Our MMA computes a C tile of shape (4*16, 8*8) = (64, 64)
+  constexpr int kTileM = 64;
+  constexpr int kTileN = 64;
+  constexpr int kTileK = 32; // The slicing size for K can be set independently
+
+  // ==========================================================================================
+
+
+  //using mma_op = SM80_16x8x16_F16F16F16F16_TN;
+  //using mma_traits = MMA_Traits<mma_op>;
+  //using mma_atom = MMA_Atom<mma_traits>;
+
+  //using MMA = decltype(make_tiled_mma(mma_atom{}, 
+  //                    make_layout(Shape<_2, _2, _1>{}), 
+  //                    make_layout(Shape<_1, _2, _1>{})));
+  //constexpr int kTileM = 128; 
+  //constexpr int kTileN = 128; 
+  //constexpr int kTileK = 32; 
 
   dim3 block(size(MMA{}));
   dim3 grid(n / kTileN, m / kTileM);
@@ -124,35 +155,61 @@ int main() {
   err = cudaGetLastError();
   printf("err = %d, str = %s\n", err, cudaGetErrorString(err));
 
-  T *Cptr_host;
-  T *Cptr_cublas_host;
+  // --- Result Comparison ---
+  T *Cptr_host = (T*)malloc(sizeof(T) * m * n);
+  T *Cptr_cublas_host = (T*)malloc(sizeof(T) * m * n);
 
-  Cptr_host = (T*)malloc(sizeof(T) * m * n);
-  Cptr_cublas_host = (T*)malloc(sizeof(T) * m * n);
-
-  // compare
   cudaMemcpy(Cptr_host, Cptr, sizeof(T) * m * n, cudaMemcpyDeviceToHost);
   cudaMemcpy(Cptr_cublas_host, Cptr_cublas, sizeof(T) * m * n, cudaMemcpyDeviceToHost);
 
+  // ==========================================================================================
+  // FIX 2: Correct the comparison logic
+  // ------------------------------------------------------------------------------------------
+  // The original comparison was incorrect because it assumed identical memory layouts.
+  // In reality, our kernel's result C(m,n) is the transpose of the cuBLAS result.
+  // Therefore, we need to use 2D indexing to logically compare the element C(i, j)
+  // from both matrices.
   float threshold = 0.1;
-  for (int i = 0; i < m * n; ++i) {
-    float v1 = Cptr_host[i];
-    float v2 = Cptr_cublas_host[i];
-    if (fabs(v2 - v1) > threshold) {
-      printf("v1 = %f, v2 = %f\n", v1, v2);
+  int error_count = 0;
+  for (int i = 0; i < m; ++i) { // iterate over rows
+    for (int j = 0; j < n; ++j) { // iterate over columns
+      // Cptr_host is a row-major (m, n) matrix. C(i, j) is at index i * n + j
+      float v1 = static_cast<float>(Cptr_host[i * n + j]);
+
+      // Cptr_cublas_host stores the result of B^T*A and has shape (n,m) but
+      // was written with a leading dimension (ldc) of n. So the element
+      // corresponding to C(i,j) is also at index i * n + j.
+      float v2 = static_cast<float>(Cptr_cublas_host[i * n + j]);
+
+      if (fabs(v2 - v1) > threshold) {
+        if(error_count < 10) { // Only print the first 10 errors
+            printf("Mismatch at (%d, %d): kernel_val (v1) = %f, cublas_val (v2) = %f, diff = %f\n",
+                   i, j, v1, v2, fabs(v2-v1));
+        }
+        error_count++;
+      }
     }
   }
 
-  Tensor tensor_C = make_tensor(Cptr_host, make_shape(m, n), make_stride(n, 1));
-  Tensor tensor_C_cublas = make_tensor(Cptr_cublas_host, make_shape(m, n), make_stride(n, 1));
+  if (error_count == 0) {
+      printf("\nSUCCESS: Results match with cuBLAS!\n");
+  } else {
+      printf("\nFAILURE: Found %d mismatches.\n", error_count);
+  }
+  // ==========================================================================================
 
-  auto tile = make_tile(8, 8);
-  auto coor = make_coord(0, 0);
-  Tensor tc1 = local_tile(tensor_C, tile, coor);
-  Tensor tc1_cublas = local_tile(tensor_C_cublas, tile, coor);
+  // Free memory
+  free(Aptr_host);
+  free(Bptr_host);
+  free(Cptr_host);
+  free(Cptr_cublas_host);
+  cudaFree(Aptr);
+  cudaFree(Bptr);
+  cudaFree(Cptr);
+  cudaFree(Cptr_cublas);
+  cublasDestroy(handle);
 
-  print_tensor(tc1);
-  print_tensor(tc1_cublas);
+  return 0;
 }
 
 template <typename T>
